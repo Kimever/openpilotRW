@@ -24,7 +24,7 @@ class Port:
   BROADCAST_PORT = 2899
   RECEIVE_PORT = 3843
   LOCATION_PORT = BROADCAST_PORT
-  CARSTATE_PUBLISH_PORT = 3847
+  CS_PORT = 3847
   NAVI_GPS_PORT = 3931
   NAVI_OBSTACLES_PORT = 3932
   SEND_OBSTACLE_PORT = 3946
@@ -133,7 +133,7 @@ class NaviServer:
         pass
 
   def update_thread(self, sm):
-    rk = Ratekeeper(10, print_delay_threshold=None)
+    rk = Ratekeeper(20, print_delay_threshold=None) # 20Hz (50ms)
 
     while not terminate_flag.is_set():
       sm.update(0)
@@ -142,7 +142,7 @@ class NaviServer:
         v_ego = sm['carState'].vEgo
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
           data_in_bytes = struct.pack('!f', v_ego)
-          sock.sendto(data_in_bytes, ('127.0.0.1', Port.CARSTATE_PUBLISH_PORT))
+          sock.sendto(data_in_bytes, ('127.0.0.1', Port.CS_PORT))
 
       rk.keep_time()
 
@@ -195,8 +195,7 @@ class NaviServer:
           except:
             pass
 
-        try:
-          self.lock.acquire()
+        with self.lock:
           try:
             if 'active' in json_obj:
               self.active = json_obj['active']
@@ -211,33 +210,31 @@ class NaviServer:
           if 'traffic_signal' in json_obj:
             self.json_traffic_signal = json_obj['traffic_signal']
 
-        finally:
-          self.lock.release()
-
     except:
-
-      try:
-        self.lock.acquire()
+      with self.lock:
         self.json_road_limit = None
         self.json_traffic_signal = None
-      finally:
-        self.lock.release()
 
     return ret
 
   def check(self):
     now = time.monotonic()
     if now - self.last_updated > 3.:
-      try:
-        self.lock.acquire()
+      with self.lock:
         self.json_road_limit = None
         self.json_traffic_signal = None
-      finally:
-        self.lock.release()
 
     if now - self.last_updated_active > 3.:
       self.active = 0
       self.remote_addr = None
+
+  def get_all_navi_data(self):
+    with self.lock:
+      return {
+        'road_limit': self.json_road_limit,
+        'traffic_signal': self.json_traffic_signal,
+        'active': self.active
+      }
 
   def get_limit_val(self, key, default=None):
     return self.get_json_val(self.json_road_limit, key, default)
@@ -246,9 +243,10 @@ class NaviServer:
     return self.get_json_val(self.json_traffic_signal, key, default)
 
   def get_json_val(self, json_data, key, default=None):
-    if json_data is None:
-      return default
-    return json_data.get(key, default)
+    with self.lock:
+      if json_data is None:
+        return default
+      return json_data.get(key, default)
 
 def navi_gps_thread():
   naviGps = messaging.pub_sock('naviGps')
@@ -270,7 +268,7 @@ def navi_gps_thread():
 def navi_obstacles_thread():
   naviObstacles = messaging.pub_sock('naviObstacles')
   with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-    sock.bind(('0.0.0.0', 3932))
+    sock.bind(('0.0.0.0', Port.NAVI_OBSTACLES_PORT))
     while not terminate_flag.is_set():
       try:
         data, address = sock.recvfrom(13*4+1)
@@ -293,37 +291,41 @@ def send_obstacle(cam_type, distance, speed, v_ego, s):
 def publish_thread(server):
   sm = server.sm
   naviData = messaging.pub_sock('naviData')
-  rk = Ratekeeper(10.0, print_delay_threshold=None)
+  rk = Ratekeeper(20.0, print_delay_threshold=None) # 20Hz (50ms)
   v_ego_q = deque(maxlen=3)
 
   while not terminate_flag.is_set():
+    navi_data = server.get_all_navi_data()
+
     dat = messaging.new_message('naviData', valid=True)
     navi = dat.naviData
-    navi.active = server.active
-    navi.roadLimitSpeed = server.get_limit_val("road_limit_speed", 0)
-    navi.isHighway = server.get_limit_val("is_highway", False)
-    navi.camType = server.get_limit_val("cam_type", 0)
-    navi.camLimitSpeedLeftDist = server.get_limit_val("cam_limit_speed_left_dist", 0)
-    navi.camLimitSpeed = server.get_limit_val("cam_limit_speed", 0)
-    navi.sectionLimitSpeed = server.get_limit_val("section_limit_speed", 0)
-    navi.sectionLeftDist = server.get_limit_val("section_left_dist", 0)
-    navi.sectionAvgSpeed = server.get_limit_val("section_avg_speed", 0)
-    navi.sectionLeftTime = server.get_limit_val("section_left_time", 0)
-    navi.sectionAdjustSpeed = server.get_limit_val("section_adjust_speed", False)
-    navi.camSpeedFactor = server.get_limit_val("cam_speed_factor", CAMERA_SPEED_FACTOR)
-    navi.currentRoadName = server.get_limit_val("current_road_name", "")
-    navi.isNda2 = server.get_limit_val("is_nda2", False)
+    navi.active = navi_data['active']
 
-    ts = {
-      'isGreenLightOn': server.get_ts_val("isGreenLightOn", False),
-      'isLeftLightOn': server.get_ts_val("isLeftLightOn", False),
-      'isRedLightOn': server.get_ts_val("isRedLightOn", False),
-      'greenLightRemainTime': server.get_ts_val("greenLightRemainTime", 0),
-      'leftLightRemainTime': server.get_ts_val("leftLightRemainTime", 0),
-      'redLightRemainTime': server.get_ts_val("redLightRemainTime", 0),
-      'distance': server.get_ts_val("distance", 0)
+    road_limit = navi_data['road_limit'] or {}
+    navi.roadLimitSpeed = road_limit.get("road_limit_speed", 0)
+    navi.isHighway = road_limit.get("is_highway", False)
+    navi.camType = road_limit.get("cam_type", 0)
+    navi.camLimitSpeedLeftDist = road_limit.get("cam_limit_speed_left_dist", 0)
+    navi.camLimitSpeed = road_limit.get("cam_limit_speed", 0)
+    navi.sectionLimitSpeed = road_limit.get("section_limit_speed", 0)
+    navi.sectionLeftDist = road_limit.get("section_left_dist", 0)
+    navi.sectionAvgSpeed = road_limit.get("section_avg_speed", 0)
+    navi.sectionLeftTime = road_limit.get("section_left_time", 0)
+    navi.sectionAdjustSpeed = road_limit.get("section_adjust_speed", False)
+    navi.camSpeedFactor = road_limit.get("cam_speed_factor", CAMERA_SPEED_FACTOR)
+    navi.currentRoadName = road_limit.get("current_road_name", "")
+    navi.isNda2 = road_limit.get("is_nda2", False)
+
+    traffic_signal = navi_data['traffic_signal'] or {}
+    navi.ts = {
+      'isGreenLightOn': traffic_signal.get("isGreenLightOn", False),
+      'isLeftLightOn': traffic_signal.get("isLeftLightOn", False),
+      'isRedLightOn': traffic_signal.get("isRedLightOn", False),
+      'greenLightRemainTime': traffic_signal.get("greenLightRemainTime", 0),
+      'leftLightRemainTime': traffic_signal.get("leftLightRemainTime", 0),
+      'redLightRemainTime': traffic_signal.get("redLightRemainTime", 0),
+      'distance': traffic_signal.get("distance", 0)
     }
-    navi.ts = ts
 
     sm.update(0)
     if sm.updated['carState']:

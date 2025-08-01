@@ -6,6 +6,7 @@ import numpy as np
 from opendbc.car import structs
 from openpilot.common.params import Params
 from openpilot.common.conversions import Conversions as CV
+from openpilot.common.realtime import Ratekeeper
 from openpilot.selfdrive.car.cruise import (V_CRUISE_MIN, V_CRUISE_MAX, V_CRUISE_UNSET, V_CRUISE_INITIAL, V_CRUISE_INITIAL_EXPERIMENTAL_MODE,
                                             CRUISE_LONG_PRESS, IMPERIAL_INCREMENT)
 from opendbc.car.hyundai.values import Buttons, HyundaiFlags
@@ -97,6 +98,16 @@ class CruiseController:
     self.min_set_speed_clu = self.conv.to_current_unit(V_CRUISE_MIN) if CruiseStateManager.instance().cruise_state_control else self.conv.to_current_unit(V_CRUISE_INITIAL)
     self.max_set_speed_clu = self.conv.to_current_unit(V_CRUISE_MAX)
 
+    self.limit_speed_ratekeeper = Ratekeeper(20.0, print_delay_threshold=None)
+
+    self.cached_road_limit_speed_clu = NO_LIMIT_SPEED
+    self.cached_camera_limit_speed_clu = NO_LIMIT_SPEED
+    self.cached_steer_limit_speed_clu = NO_LIMIT_SPEED
+    self.cached_lead_limit_speed_clu = NO_LIMIT_SPEED
+    self.cached_curve_speed_clu = NO_LIMIT_SPEED
+    self.cached_apply_limit_speed_clu = NO_LIMIT_SPEED
+    self.limit_speed_update_needed = True
+
     self.btn = Buttons.NONE
     self.target_speed_clu = 0.
     self.apply_limit_speed_clu = 0.
@@ -143,7 +154,24 @@ class CruiseController:
     self.apply_limit_speed_clu = 0.
     self.curve_speed_clu = 0.
 
+  def _should_update_limit_speed(self):
+    self.limit_speed_ratekeeper.monitor_time()
+
+    if self.limit_speed_ratekeeper.remaining <= 0 or self.limit_speed_update_needed:
+      self.limit_speed_update_needed = False
+      return True
+    return False
+
   def _cal_limit_speed(self, CS, sm, current_speed_ms: float, cluster_speed_clu: float, v_cruise_kph: float):
+    if not self._should_update_limit_speed():
+      self.road_limit_speed_clu = self.cached_road_limit_speed_clu
+      self.camera_limit_speed_clu = self.cached_camera_limit_speed_clu
+      self.steer_limit_speed_clu = self.cached_steer_limit_speed_clu
+      self.lead_limit_speed_clu = self.cached_lead_limit_speed_clu
+      self.curve_speed_clu = self.cached_curve_speed_clu
+      self.apply_limit_speed_clu = self.cached_apply_limit_speed_clu
+      return
+
     nda_active = SpeedLimiter.instance().get_active()
     road_limit_speed_nda = SpeedLimiter.instance().get_road_limit_speed()
     road_limit_speed_stock = CS.exState.navLimitSpeed
@@ -159,6 +187,7 @@ class CruiseController:
     ratio = np.interp(road_limit_speed, [self.conv.to_current_unit(10.0), self.conv.to_current_unit(100.0)], [1.30, 1.10])
     road_limit_speed_clu = road_limit_speed * ratio if road_limit_speed else NO_LIMIT_SPEED
     self.road_limit_speed_clu = road_limit_speed_clu
+    self.cached_road_limit_speed_clu = road_limit_speed_clu
 
     # 2. Camera limit speed
     camera_limit_speed_clu = NO_LIMIT_SPEED
@@ -171,6 +200,7 @@ class CruiseController:
         SpeedLimiter.instance().get_camera_limit_speed_stock(CS.speedLimitDistance, CS.speedLimit, self.conv))
       camera_limit_speed_clu = camera_limit_speed_stock
     self.camera_limit_speed_clu = camera_limit_speed_clu
+    self.cached_camera_limit_speed_clu = camera_limit_speed_clu
 
     # 3. Section limit speed
     section_limit_speed, section_left_dist = SpeedLimiter.instance().get_section_limit_speed()
@@ -185,15 +215,18 @@ class CruiseController:
     lead_speed = self._cal_lead_speed(lead, cluster_speed_clu)
     lead_limit_speed_clu = lead_speed if self.CP.openpilotLongitudinalControl and lead.status else NO_LIMIT_SPEED
     self.lead_limit_speed_clu = lead_limit_speed_clu
+    self.cached_lead_limit_speed_clu = lead_limit_speed_clu
 
     # 5. Curve limit speed
     model = sm['modelV2']
     curve_limit_speed_clu = self._cal_curve_speed_adaptive(model, current_speed_ms, v_cruise_kph)
     self.curve_speed_clu = curve_limit_speed_clu
+    self.cached_curve_speed_clu = curve_limit_speed_clu
 
     # 6. Steering angle based limit speed
     steer_limit_speed_clu = self._cal_steer_based_speed(current_speed_ms, CS.steeringAngleDeg)
     self.steer_limit_speed_clu = steer_limit_speed_clu
+    self.cached_steer_limit_speed_clu = steer_limit_speed_clu
 
     speed_candidates = [
       road_limit_speed_clu,
@@ -212,6 +245,8 @@ class CruiseController:
       error = calculated_max_speed_clu - self.apply_limit_speed_clu
       kp = np.interp(abs(error), [0, 2, 5, 10], [0.01, 0.05, 0.10, 0.20])
       self.apply_limit_speed_clu += error * kp
+
+    self.cached_apply_limit_speed_clu = self.apply_limit_speed_clu
 
   def _cal_lead_speed(self, lead, cluster_speed_clu: float):
     lead_distance_buffer = 5.
